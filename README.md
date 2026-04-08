@@ -40,11 +40,26 @@ source ./.venv/bin/activate
 pip install -r ./requirements.txt
 ```
 
-Then, start the GUI with:
+Then, start the GUI by providing a scene file (XML) or a Jupyter notebook:
 
 ```bash
-python ./scripts/run.py
+# Run with an XML scene
+python ./scripts/run.py path/to/scene.xml
+
+# Run with a Jupyter notebook (extracts scene and scenario parameters)
+python ./scripts/run.py example_scenario.ipynb
 ```
+
+GUI Features
+------------
+
+- **Real-time Ray-traced Rendering**: High-quality visualization using Mitsuba 3.
+- **Interactive Materials**: A dedicated **Materials** section allows you to visualize and edit colors for all radio materials in the scene.
+- **Mesh Selection**: Click on any mesh in the 3D view to identify it and its assigned material.
+- **Road & Route Visualization**: Automatic detection of roads/routes with visibility enhancements like **Road lift (Z)** and flat shading to prevent Z-fighting.
+- **Advanced Lighting Controls**: Adjust environment map brightness and sun orientation in real-time.
+- **Animation**: Record and play back trajectories for transmitters and receivers.
+- **Radio Map & Path Tracing**: Compute and visualize SINR, RSS, and propagation paths interactively.
 
 GUI controls
 ------------
@@ -74,6 +89,22 @@ Almost all parameters can be set using YAML configuration files, see e.g. [`conf
 
 ```bash
 sionna-rt-gui --config path/to/config.yaml
+```
+
+### Scenario Configuration
+
+You can load scenarios directly from a **Jupyter notebook**.
+![custom_scene.png](src/sionna_rt_gui/data/custom_scene.png)
+**Using a Jupyter Notebook:**
+When you pass a `.ipynb` file to `run.py`, the GUI automatically:
+1. Finds the XML scene file by looking for `load_scene("...")` in the code.
+2. Extracts parameters for `sites`, `road_segments`, `num_ue`, `carrier_frequency`, `tx_array`, and `rx_array`.
+3. Populates the scene and animations automatically.
+
+See [example_scenario.ipynb](src/sionna_rt_gui/data/scenes/example_scenario.ipynb) for a template.
+
+```bash
+python ./scripts/run.py path/to/notebook.ipynb
 ```
 
 ### Live reload mode

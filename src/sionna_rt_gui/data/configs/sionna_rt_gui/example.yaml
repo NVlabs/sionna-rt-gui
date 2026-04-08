@@ -1,5 +1,6 @@
 background_color: [0.05, 0.05, 0.05]
 gui_mode: FULL
+scene_filename: "etoile"
 
 tx_array:
   vertical_spacing: 0.25

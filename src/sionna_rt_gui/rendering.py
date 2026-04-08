@@ -81,7 +81,8 @@ def setup_scene_for_rendering(
     if k in params:
         # Height, width, channels
         h, *_ = dr.shape(params[k])
-        params[k][int(0.6 * h) :, :, :] = 0
+        # Reduce the hack: keep more of the horizon but still dim the bottom
+        params[k][int(0.8 * h) :, :, :] = 0
 
     integrator = {
         "type": "path",
@@ -222,6 +223,11 @@ def _render_scene(
     depth = perpendicular_depth[:, :, 0] / radial_factor
     depth = dr.select(depth == 0, dr.inf, depth)
 
+    # Add a tiny depth bias (0.1%) to push the rendered background slightly
+    # further away, ensuring Polyscope 3D structures (dots, arrows, paths)
+    # placed on surfaces remain visible and don't get occluded by Z-fighting.
+    depth = depth * 1.001
+
     aovs = [depth]
     if use_denoiser:
         # Albedo
@@ -257,7 +263,7 @@ def set_envmap_rotation(
     angle_deg: float,
     axis: tuple[float, float, float] = (0, 0, 1),
 ) -> bool:
-    if "visual_scene" not in cache:
+    if cache is None or "visual_scene" not in cache:
         return False
 
     props = mi.traverse(cache["visual_scene"])
@@ -268,6 +274,22 @@ def set_envmap_rotation(
         mi.ScalarTransform4f.rotate(axis=axis, angle=angle_deg)
         @ cache["envmap_base_transform"]
     )
+    props.update()
+    return True
+
+
+def set_envmap_intensity(
+    cache: dict[str, Any],
+    intensity: float,
+) -> bool:
+    if cache is None or "visual_scene" not in cache:
+        return False
+
+    props = mi.traverse(cache["visual_scene"])
+    if "emitter.scale" not in props:
+        return False
+
+    props["emitter.scale"] = intensity
     props.update()
     return True
 

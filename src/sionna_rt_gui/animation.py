@@ -73,11 +73,17 @@ class Trajectory:
 
         start_dist = self._cumulative_distances[start_idx]
         end_dist = self._cumulative_distances[end_idx]
-        t = (safe_dist - start_dist) / (end_dist - start_dist)
+        dist_diff = end_dist - start_dist
+        if dist_diff == 0:
+            return self.points[start_idx], np.zeros(3)
+        t = (safe_dist - start_dist) / dist_diff
 
         direction = self.points[end_idx] - self.points[start_idx]
         pos = self.points[start_idx] + t * direction
-        return pos, direction / np.linalg.norm(direction)
+        norm = np.linalg.norm(direction)
+        if norm == 0:
+            return pos, np.zeros(3)
+        return pos, direction / norm
 
     def add_point(self, point: np.ndarray | list[float]):
         point = np.array(point)
@@ -263,10 +269,11 @@ def animation_tick(gui: "SionnaRtGui", time_delta: float, force: bool = False):
 
         # Update the object position accordingly
         obj = gui.scene.get(obj_name)
-        obj.position, direction = traj.current_position_and_direction()
-        # Velocity for doppler
-        obj.velocity = direction * traj.velocity
-        dr.make_opaque(obj.position, obj.velocity)
+        pos, direction = traj.current_position_and_direction()
+        # Set positions and velocities as lists of floats to avoid DrJit graph growth
+        # and ensure the setters are called correctly.
+        obj.position = [float(p) for p in pos]
+        obj.velocity = [float(v) for v in (direction * traj.velocity)]
         if isinstance(obj, rt.Transmitter):
             tx_changed = True
         elif isinstance(obj, rt.Receiver):

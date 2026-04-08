@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+import hashlib
+import logging
 import os
+import re
 import sys
 import time
 
@@ -16,7 +19,7 @@ from sionna import rt
 from sionna.rt.scene_utils import remove_objects_duplicate_vertices
 
 from . import __version__ as GUI_VERSION
-from .animation import AnimationConfig, animation_gui, animation_tick
+from .animation import AnimationConfig, animation_gui, animation_tick, LoopingMode
 from .antenna_array import antenna_array_gui
 from .config import (
     GuiConfig,
@@ -30,6 +33,7 @@ from .config import (
 from .rendering import (
     render_scene,
     set_envmap_rotation,
+    set_envmap_intensity,
     add_or_update_ray_traced_image_quantity,
 )
 from .rm_utils import radio_map_colorbar_to_image
@@ -48,6 +52,8 @@ from .sionna_utils import (
     set_or_update_radio_devices_polyscope,
 )
 from .selection import SelectionType, selection_gui
+
+logger = logging.getLogger(__name__)
 
 CTRL_OR_CMD = "Cmd" if sys.platform == "darwin" else "Ctrl"
 HELP_WINDOW_TABLES = {
@@ -83,6 +89,66 @@ HELP_WINDOW_TABLES = {
         "Alt + left click drag": "Move slice plane along its normal",
     },
 }
+
+
+def _asciify_xml_paths(xml_content: str, scene_dir: str):
+    """
+    Finds file paths in Mitsuba XML that contain non-ASCII characters and
+    replaces them with ASCII-safe paths using hard links.
+    This is a workaround for Mitsuba/Windows issues with non-ASCII filenames.
+    """
+    # Match value="..." or filename="..." that contains at least one non-ASCII character
+    pattern = re.compile(r'(value|filename)="(.*?[^\x00-\x7F].*?)"')
+
+    # Create a hidden directory for ASCII links if we find any non-ASCII paths
+    links_dir = os.path.join(scene_dir, ".sionna_rt_gui_links")
+
+    def replace_match(match):
+        attr = match.group(1)
+        path = match.group(2)
+
+        # Absolute path for checking file existence
+        abs_path = os.path.normpath(os.path.join(scene_dir, path))
+        if not os.path.isfile(abs_path):
+            # If not relative to scene_dir, try absolute
+            if os.path.isfile(path):
+                abs_path = os.path.abspath(path)
+            else:
+                return match.group(0)  # Not a file on disk, keep as is
+
+        # Create an ASCII-safe filename
+        filename = os.path.basename(path)
+        stem, ext = os.path.splitext(filename)
+
+        # Use a hash of the full path to avoid collisions
+        h = hashlib.md5(path.encode("utf-8")).hexdigest()[:8]
+        safe_stem = "".join(c if ord(c) < 128 else "_" for c in stem)
+        safe_filename = f"fixed_{h}_{safe_stem}{ext}"
+
+        # Ensure the links directory exists
+        try:
+            os.makedirs(links_dir, exist_ok=True)
+            abs_safe_path = os.path.join(links_dir, safe_filename)
+            rel_safe_path = os.path.join(".sionna_rt_gui_links", safe_filename)
+        except Exception:
+            # Fallback: create in the same directory as the original file
+            abs_safe_path = os.path.join(os.path.dirname(abs_path), safe_filename)
+            rel_safe_path = os.path.join(os.path.dirname(path), safe_filename)
+
+        # Create hard link if it doesn't exist
+        if not os.path.exists(abs_safe_path):
+            try:
+                os.link(abs_path, abs_safe_path)
+                logger.info(f"Created ASCII-safe hard link: {abs_safe_path}")
+            except Exception as e:
+                logger.warning(f"Failed to create hard link for {abs_path}: {e}")
+                return match.group(0)  # Keep original if linking fails
+
+        # Mitsuba parser uses / as separator, even on Windows
+        rel_safe_path = rel_safe_path.replace("\\", "/")
+        return f'{attr}="{rel_safe_path}"'
+
+    return pattern.sub(replace_match, xml_content)
 
 
 class SionnaRtGui:
@@ -236,57 +302,256 @@ class SionnaRtGui:
         )
         self.slice_plane = plane
 
-        # --- Example scenario
         if self.cfg.create_example_scenario:
             self.create_example_scenario(
                 set_camera=not was_initialized, add_radio_map=False
             )
 
+    def normalize_radio_materials(self):
+        """
+        MO-specific radio material normalization logic.
+        Adapted from MO_v2.py
+        """
+        radio_materials = getattr(self.scene, "radio_materials", {})
+        if not radio_materials:
+            return
+
+        def find_mat(prefix):
+            # Try to find a material that matches the prefix, possibly with mat- or itu_ prefixes
+            candidates = [prefix, f"itu_{prefix}", f"mat-{prefix}", f"mat-itu_{prefix}"]
+            for c in candidates:
+                if c in radio_materials:
+                    return c
+            return None
+
+        fallback_name = find_mat("concrete") or next(iter(radio_materials), None)
+        if fallback_name is None:
+            return
+
+        brick_name = find_mat("brick") or fallback_name
+        glass_name = find_mat("glass") or fallback_name
+        metal_name = find_mat("metal") or fallback_name
+        marble_name = find_mat("marble") or fallback_name
+        ground_name = find_mat("very_dry_ground") or find_mat("medium_dry_ground") or fallback_name
+
+        objects = getattr(self.scene, "objects", {})
+        for obj_name, obj in objects.items():
+            # If the object already has a radio material that is an ITU material, keep it.
+            curr_mat = getattr(obj, "radio_material", None)
+            if curr_mat is not None:
+                mat_name = ""
+                if isinstance(curr_mat, str):
+                    mat_name = curr_mat
+                elif hasattr(curr_mat, "name"):
+                    mat_name = curr_mat.name
+                elif hasattr(curr_mat, "id"):
+                    mat_name = curr_mat.id()
+
+                # Strip common prefixes
+                stripped_mat_name = mat_name
+                if stripped_mat_name.startswith("mat-"):
+                    stripped_mat_name = stripped_mat_name[4:]
+
+                # If the object already has a radio material that is an ITU material,
+                # we usually keep it. 
+                if stripped_mat_name.lower().startswith("itu_"):
+                    # We only override if it's very clearly a mismatch, but the user
+                    # wants to distinguish ground from plane now.
+                    # If it's marble, we'll let it stay marble (black) if it's a "plane".
+                    continue
+                else:
+                    pass
+
+            name = obj_name.lower()
+            target = None
+
+            if "brick" in name:
+                target = brick_name
+            elif "glass" in name or "window" in name:
+                target = glass_name
+            elif "metal" in name or "steel" in name or "roof" in name:
+                target = metal_name
+            elif "marble" in name or "white" in name or "road" in name or "route" in name:
+                target = marble_name
+            elif "ground" in name or "terrain" in name:
+                target = ground_name
+            elif "plane" in name:
+                # Let it keep its original material if it has one (likely marble/black)
+                # or map it to ground if it's truly unknown.
+                if curr_mat is None:
+                    target = ground_name
+                else:
+                    target = None
+            elif "concrete" in name:
+                target = fallback_name
+            
+            if target is None:
+                continue
+
+            try:
+                obj.radio_material = radio_materials[target]
+            except Exception:
+                try:
+                    obj.radio_material = target
+                except Exception:
+                    pass
+
+    def update_material_color(self, mat_id_or_obj, new_color):
+        """Update a material's color and synchronize with Polyscope meshes."""
+        if self.scene is None:
+            return
+
+        if isinstance(mat_id_or_obj, str):
+            mat_id = mat_id_or_obj
+            mat = self.scene.radio_materials.get(mat_id)
+        else:
+            mat = mat_id_or_obj
+            mat_id = getattr(mat, "id", lambda: "")()
+            if not mat_id and hasattr(mat, "name"):
+                mat_id = mat.name
+
+        if mat is not None and hasattr(mat, "color"):
+            mat.color = new_color
+
+        if not mat_id:
+            # Try to find the ID from radio_materials if we only have the object
+            for name, m in self.scene.radio_materials.items():
+                if m is mat:
+                    mat_id = name
+                    break
+
+        if not mat_id:
+            return
+
+        def get_clean_id(id_str):
+            if id_str.startswith("mat-itu_"):
+                return id_str[8:]
+            if id_str.startswith("itu_"):
+                return id_str[4:]
+            if id_str.startswith("mat-"):
+                return id_str[4:]
+            return id_str
+
+        target_clean = get_clean_id(mat_id)
+        logger.debug(
+            f"Updating material color for '{mat_id}' (clean: '{target_clean}') to {new_color}"
+        )
+
+        # Update all meshes using this material
+        for mesh in self.scene.mi_scene.shapes():
+            mesh_mat = mesh.bsdf()
+            mesh_mat_id = getattr(mesh_mat, "id", lambda: "")()
+            if not mesh_mat_id and hasattr(mesh_mat, "name"):
+                mesh_mat_id = mesh_mat.name
+
+            if not mesh_mat_id:
+                continue
+
+            # Check if material matches by ID (original or stripped)
+            if (
+                (mesh_mat is mat)
+                or (mesh_mat_id == mat_id)
+                or (get_clean_id(mesh_mat_id) == target_clean)
+            ):
+                if ps.has_surface_mesh(mesh.id()):
+                    ps.get_surface_mesh(mesh.id()).set_color(new_color)
+
     def create_example_scenario(
         self, set_camera: bool = True, add_radio_map: bool = True
     ):
         if set_camera:
-            self.home_camera_to_world = np.array(
-                [
-                    [
-                        2.0079615e-03,
-                        -9.9999154e-01,
-                        -3.9256822e-08,
-                        4.4776478e00,
-                    ],
-                    [7.8317523e-01, 1.5742097e-03, 6.2179816e-01, 1.1707677e01],
-                    [
-                        -6.2179959e-01,
-                        -1.2489425e-03,
-                        7.8317869e-01,
-                        -2.2836572e02,
-                    ],
-                    [0.0000000e00, 0.0000000e00, 0.0000000e00, 1.0000000e00],
-                ]
+            self.fit_camera_to_scene()
+            self.home_camera_to_world = ps.get_camera_view_matrix()
+
+        has_custom_scenario = (
+            len(self.cfg.scenario.sites) > 0 or len(self.cfg.scenario.road_segments) > 0
+        )
+
+        if has_custom_scenario:
+            # 1. Add transmitters from sites
+            for site in self.cfg.scenario.sites:
+                # SiteConfig from OmegaConf
+                site_name = site.name
+                site_pos = site.position
+                site_downtilt = site.downtilt
+                site_azimuths = site.azimuths
+                site_power_dbm = site.power_dbm
+
+                for i, az in enumerate(site_azimuths):
+                    tx = rt.Transmitter(
+                        name=f"{site_name}_sector_{i + 1}",
+                        position=[float(p) for p in site_pos],
+                        orientation=[
+                            float(np.deg2rad(az)),
+                            float(np.deg2rad(site_downtilt)),
+                            0.0,
+                        ],
+                        power_dbm=float(site_power_dbm),
+                    )
+                    self.scene.add(tx)
+
+            # 2. Add UEs along road segments
+            if self.cfg.scenario.road_segments:
+                # Reproducible seed for random UEs
+                rng = np.random.default_rng(48)
+                for i in range(self.cfg.scenario.num_ue):
+                    seg_idx = rng.integers(len(self.cfg.scenario.road_segments))
+                    s, e = self.cfg.scenario.road_segments[seg_idx]
+                    s, e = np.array(s), np.array(e)
+
+                    # Start at a random point along the entire segment
+                    t_start = rng.random()
+                    p_start = s + t_start * (e - s)
+
+                    rx_name = f"rx-{i}"
+                    rx = rt.Receiver(name=rx_name, position=p_start.tolist())
+                    self.scene.add(rx)
+
+                    traj = self.animation_config.trajectories[rx_name]
+                    traj.add_point(s.tolist())
+                    traj.add_point(e.tolist())
+                    traj.enabled = True
+                    # Set the initial distance based on the random start point
+                    traj.distance = t_start * traj.total_distance()
+                    # Randomize initial direction
+                    traj.backward = rng.random() > 0.5
+                    # Set looping mode to mirror (bounce back)
+                    traj.looping_mode_i = int(LoopingMode.Mirror.value)
+
+                self.animation_config.playing = True
+                self.animation_config.speed_multiplier = 20.0
+
+            # Update Polyscope for radio devices
+            set_or_update_radio_devices_polyscope(
+                self.scene.transmitters, True, self
             )
-            self.move_camera_home()
-
-        # Add some example transmitters
-        for pos in [
-            [-34.0, 13.0, 33.0],
-        ]:
-            self.add_radio_device(pos, is_transmitter=True, allow_auto_update=False)
-
-            shifted = [pos[0] + 15, pos[1] - 14, pos[2] - 20]
-            self.add_radio_device(
-                shifted, is_transmitter=False, allow_auto_update=False
+            set_or_update_radio_devices_polyscope(
+                self.scene.receivers, False, self
             )
 
-        # Example animation
-        p = self.scene.get("rx-0").position.numpy().squeeze()
-        traj = self.animation_config.trajectories["rx-0"]
-        traj.add_point(p - [0, 30, 0])
-        traj.add_point(p)
-        traj.add_point(p + [40, 0, 0])
-        traj.enabled = True
-        traj.distance = 0.0  # Start at the first point
-        self.animation_config.playing = True
-        self.animation_config.speed_multiplier = 10.0
+        else:
+            # Default example transmitters
+            for pos in [[-34.0, 13.0, 33.0]]:
+                self.add_radio_device(
+                    pos, is_transmitter=True, allow_auto_update=False
+                )
+
+                shifted = [pos[0] + 15, pos[1] - 14, pos[2] - 20]
+                self.add_radio_device(
+                    shifted, is_transmitter=False, allow_auto_update=False
+                )
+
+            # Default example animation
+            if "rx-0" in self.scene.receivers:
+                p = self.scene.get("rx-0").position.numpy().squeeze()
+                traj = self.animation_config.trajectories["rx-0"]
+                traj.add_point(p - [0, 30, 0])
+                traj.add_point(p)
+                traj.add_point(p + [40, 0, 0])
+                traj.enabled = True
+                traj.distance = 0.0
+                self.animation_config.playing = True
+                self.animation_config.speed_multiplier = 10.0
 
         if add_radio_map:
             self.set_radio_map(self.compute_radio_map(), show=True)
@@ -314,11 +579,40 @@ class SionnaRtGui:
 
     def load_scene(self, scene_path: str, recenter_camera: bool = True):
         self.reset_and_setup_structures()
-        self.scene = rt.load_scene(scene_path)
+        # Fix for encoding issues on Windows with special characters in filenames (e.g. œ)
+        try:
+            with open(scene_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            scene_dir = os.path.dirname(scene_path)
+            # WORKAROUND: Mitsuba on Windows fails on non-ASCII filenames.
+            # We create ASCII-safe hard links for those files and update the XML.
+            content = _asciify_xml_paths(content, scene_dir)
+
+            # Reproduce Sionna's load_scene logic but with explicit utf-8 encoding
+            fres_old = mi.file_resolver()
+            fres = mi.FileResolver(fres_old)
+            fres.append(scene_dir)
+            try:
+                mi.set_file_resolver(fres)
+                self.scene = rt.load_scene_from_string(content)
+            finally:
+                mi.set_file_resolver(fres_old)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load scene from string with utf-8, falling back to default: {e}"
+            )
+            self.scene = rt.load_scene(scene_path)
+
         remove_objects_duplicate_vertices(self.scene.mi_scene)
+
+        self.normalize_radio_materials()
 
         self.scene.tx_array = self.cfg.tx_array.create()
         self.scene.rx_array = self.cfg.rx_array.create()
+
+        if self.cfg.scenario.carrier_frequency is not None:
+            self.scene.frequency = float(self.cfg.scenario.carrier_frequency)
 
         thickness = self.cfg.radio_material_thickness
         scattering_coefficient = self.cfg.radio_material_scattering_coefficient
@@ -344,7 +638,7 @@ class SionnaRtGui:
         except ValueError:
             self.current_scene_idx = 0
 
-        add_scene_to_polyscope(self.scene, self.ps_groups)
+        add_scene_to_polyscope(self.scene, self.ps_groups, self.cfg.road_lift)
         self.set_rendering_mode(self.cfg.rendering.mode)
         if recenter_camera:
             self.fit_camera_to_scene()
@@ -425,10 +719,16 @@ class SionnaRtGui:
 
     def tick(self):
         if self.load_scene_requested is not None:
-            try:
-                self.load_scene(self.load_scene_requested)
-            except Exception as e:
-                print(f'[!] Failed loading scene "{self.load_scene_requested}":\n{e}')
+            # If load_scene_requested is a boolean True, it means we want to reload the current scene
+            path_to_load = self.load_scene_requested
+            if path_to_load is True:
+                path_to_load = self.cfg.scene_filename
+            
+            if path_to_load is not None:
+                try:
+                    self.load_scene(path_to_load)
+                except Exception as e:
+                    print(f'[!] Failed loading scene "{path_to_load}":\n{e}')
             self.load_scene_requested = None
 
         self.process_inputs()
@@ -741,8 +1041,8 @@ class SionnaRtGui:
 
         new_rd = (rt.Transmitter if is_transmitter else rt.Receiver)(
             name=f"{prefix}-{free_index}",
-            position=position,
-            orientation=[0, 0, 0],
+            position=[float(p) for p in position],
+            orientation=[0.0, 0.0, 0.0],
         )
         self.scene.add(new_rd)
 
@@ -999,6 +1299,13 @@ class SionnaRtGui:
             self.selected_object = list(self.scene._receivers.values())[picked_index]
             self.selected_type = SelectionType.Receiver
             return True
+        elif ps.has_surface_mesh(pick_result.structure_name):
+            # Check if it's one of our scene meshes
+            objects = getattr(self.scene, "objects", {})
+            if pick_result.structure_name in objects:
+                self.selected_object = objects[pick_result.structure_name]
+                self.selected_type = SelectionType.Mesh
+                return True
 
         self.clear_selection()
         return False
@@ -1089,7 +1396,26 @@ class SionnaRtGui:
             if changed:
                 self.load_scene_requested = self.known_scene_paths[combo_i]
 
+            if self.cfg.scenario_filename:
+                psim.Spacing()
+                if psim.Button("Reload Scenario", size=(psim.GetContentRegionAvail()[0], 0)):
+                    self.code_reload_requested = True
+
             psim.Spacing()
+
+            changed, val = psim.SliderFloat(
+                "Road lift (Z)",
+                self.cfg.road_lift,
+                v_min=0.0,
+                v_max=1.0,
+                format="%.3f",
+            )
+            if changed:
+                self.cfg.road_lift = val
+                self.load_scene_requested = True
+
+
+        self._gui_materials()
 
         if psim.CollapsingHeader("Radio devices", psim.ImGuiTreeNodeFlags_DefaultOpen):
             psim.Spacing()
@@ -1161,6 +1487,11 @@ class SionnaRtGui:
             if self.radio_map is not None:
                 psim.Spacing()
 
+                changed_p = False
+                changed_n = False
+                changed_vmin = False
+                changed_vmax = False
+
                 psim.Text("Accumulating samples:")
 
                 psim.PushStyleColor(psim.ImGuiCol_PlotHistogram, NVIDIA_GREEN)
@@ -1194,17 +1525,40 @@ class SionnaRtGui:
                         self.rm_color_map_index
                     ]
 
+                # -- Metric selection
+                changed_m, metric_i = psim.Combo(
+                    "Metric",
+                    ["path_gain", "rss", "sinr"].index(self.cfg.radio_map.metric),
+                    ["Path gain", "RSS", "SINR"],
+                )
+                if changed_m:
+                    self.cfg.radio_map.metric = ["path_gain", "rss", "sinr"][metric_i]
+                needs_visual_update = (
+                    changed_cmap or changed_m or changed_vmin or changed_vmax
+                )
+
+                if self.cfg.radio_map.metric in ["rss", "sinr"]:
+                    changed_p, self.cfg.radio_map.tx_power_dbm = psim.InputFloat(
+                        "TX Power (dBm)", self.cfg.radio_map.tx_power_dbm
+                    )
+                    needs_visual_update |= changed_p
+                if self.cfg.radio_map.metric == "sinr":
+                    changed_n, self.cfg.radio_map.noise_power_dbm = psim.InputFloat(
+                        "Noise Power (dBm)", self.cfg.radio_map.noise_power_dbm
+                    )
+                    needs_visual_update |= changed_n
+
                 changed_vmin, self.cfg.radio_map.vmin = psim.SliderFloat(
                     "vmin",
                     self.cfg.radio_map.vmin,
                     v_min=-200,
-                    v_max=0,
+                    v_max=100,
                 )
                 changed_vmax, self.cfg.radio_map.vmax = psim.SliderFloat(
                     "vmax",
                     self.cfg.radio_map.vmax,
                     v_min=-200,
-                    v_max=0,
+                    v_max=100,
                 )
                 self.cfg.radio_map.vmin = min(
                     self.cfg.radio_map.vmin, self.cfg.radio_map.vmax
@@ -1213,7 +1567,28 @@ class SionnaRtGui:
                     self.cfg.radio_map.vmin, self.cfg.radio_map.vmax
                 )
 
-                needs_visual_update = changed_cmap or changed_vmin or changed_vmax
+                if self.cfg.radio_map.center is not None:
+                    # Allow adjusting the height (Z-offset) of the radio map
+                    center_list = list(self.cfg.radio_map.center)
+                    psim.SetNextItemWidth(150 * self.ui_scale)
+                    changed_z_s, center_list[2] = psim.SliderFloat(
+                        "##height_z_slider",
+                        center_list[2],
+                        v_min=-20.0,
+                        v_max=100.0,
+                    )
+                    psim.SameLine()
+                    psim.SetNextItemWidth(80 * self.ui_scale)
+                    changed_z_i, center_list[2] = psim.InputFloat(
+                        "Height (Z)",
+                        center_list[2],
+                    )
+                    changed_z = changed_z_s or changed_z_i
+                    if changed_z:
+                        self.cfg.radio_map.center = tuple(center_list)
+                        needs_update = True
+
+                needs_visual_update |= changed_cmap or changed_vmin or changed_vmax
 
             if self.cfg.radio_map.auto_update and needs_update:
                 self.set_radio_map(self.compute_radio_map(), show=False)
@@ -1348,6 +1723,20 @@ class SionnaRtGui:
                     )
                     self.reset_accumulation_requested = True
 
+                changed, self.cfg.rendering.envmap_factor = psim.SliderFloat(
+                    "Lighting brightness",
+                    self.cfg.rendering.envmap_factor,
+                    v_min=0.0,
+                    v_max=20.0,
+                    format="%.1f",
+                )
+                if changed:
+                    if not set_envmap_intensity(
+                        self.render_cache, self.cfg.rendering.envmap_factor
+                    ):
+                        self.render_cache = None  # Fallback: Re-create scene
+                    self.reset_accumulation_requested = True
+
                 changed, self.cfg.rendering.use_denoiser = psim.Checkbox(
                     "Use OptiX denoiser", self.cfg.rendering.use_denoiser
                 )
@@ -1448,6 +1837,35 @@ class SionnaRtGui:
         psim.Columns(1)
 
         return any_changed
+
+    def _gui_materials(self):
+        if self.scene is None:
+            return
+
+        radio_materials = getattr(self.scene, "radio_materials", {})
+        if not radio_materials:
+            return
+
+        if psim.CollapsingHeader("Materials", psim.ImGuiTreeNodeFlags_DefaultOpen):
+            psim.Spacing()
+            for name, mat in radio_materials.items():
+                if not hasattr(mat, "color"):
+                    continue
+
+                # Convert to list if it's a drjit array or similar
+                color = list(mat.color)
+
+                changed, new_color = psim.ColorEdit3(
+                    f"##mat_color_{name}",
+                    color,
+                    psim.ImGuiColorEditFlags_NoInputs,
+                )
+                psim.SameLine()
+                psim.Text(name)
+
+                if changed:
+                    self.update_material_color(mat, new_color)
+            psim.Spacing()
 
     def gui_help_window(self):
         window_resolution = ps.get_window_size()

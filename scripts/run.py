@@ -15,14 +15,16 @@ def add_project_root_to_path():
         sys.path.append(lib_path)
 
 
-if __name__ == "__main__":
+def main():
+    # Ensure the src directory is in sys.path so we can import sionna_rt_gui
     add_project_root_to_path()
 
-from sionna_rt_gui import AppHolder, DEFAULT_CONFIG_PATH
-from sionna_rt_gui.config import load_config
+    # Hardcode/compute default config path to avoid importing whole package before parsing args.
+    # This keeps --help fast and prevents heavy dependencies (Mitsuba, Polyscope) from loading prematurely.
+    default_config_path = os.path.join(
+        os.path.dirname(__file__), "..", "src", "sionna_rt_gui", "data", "configs", "sionna_rt_gui", "base.yaml"
+    )
 
-
-def main():
     parser = argparse.ArgumentParser(
         prog=os.path.basename(__file__), description="Interactive Sionna RT GUI"
     )
@@ -30,7 +32,7 @@ def main():
         "--config",
         "-c",
         type=str,
-        default=DEFAULT_CONFIG_PATH,
+        default=default_config_path,
         help="Path to the GUI configuration file to use.",
     )
     parser.add_argument(
@@ -40,6 +42,12 @@ def main():
         default=None,
         help="Path to the Sionna RT scene to load (.xml file or name of a built-in scene).",
     )
+    parser.add_argument(
+        "--scenario",
+        type=str,
+        default=None,
+        help="Path to the scenario YAML file to use.",
+    )
     watch_group = parser.add_mutually_exclusive_group()
     watch_group.add_argument(
         "--watch", action="store_true", dest="watch", default=False
@@ -47,10 +55,16 @@ def main():
     watch_group.add_argument("--no-watch", action="store_false", dest="watch")
     args = parser.parse_args()
 
+    # Heavy imports happen here, ONLY IF arguments were successfully parsed.
+    from sionna_rt_gui import AppHolder
+    from sionna_rt_gui.config import load_config
+
     cfg_overrides = {
         "use_live_reload": args.watch,
     }
-    cfg = load_config(args.config, scene_filename=args.scene)
+    cfg = load_config(
+        args.config, scene_filename=args.scene, scenario_filename=args.scenario
+    )
 
     # Configure logging
     logging.basicConfig(
@@ -58,7 +72,12 @@ def main():
     )
 
     # --- Initialization
-    app = AppHolder(cfg, scene_filename=args.scene, overrides=cfg_overrides)
+    app = AppHolder(
+        cfg,
+        scene_filename=args.scene,
+        scenario_filename=args.scenario,
+        overrides=cfg_overrides,
+    )
 
     # --- Running loop
     app.show()

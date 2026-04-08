@@ -1,0 +1,88 @@
+# =============================================================================
+# Sionna-GUI configuration — Default simulation parameters
+# =============================================================================
+
+# Default to no specific scene; run.py or GuiConfig will provide the default built-in scene if none specified.
+scene_filename: null
+create_example_scenario: false
+
+title: "Sionna RT GUI"
+gui_mode: FULL
+background_color: [0.0, 0.0, 0.0]
+use_vsync: true
+
+# TX: PlanarArray(num_rows=2, num_cols=2, spacing=0.5, pattern="tr38901", polarization="cross")
+tx_array:
+  num_rows: 2
+  num_cols: 2
+  vertical_spacing: 0.5
+  horizontal_spacing: 0.5
+  pattern_i: 3       # "tr38901"
+  polarization_i: 3  # "cross"
+
+# RX: PlanarArray(num_rows=1, num_cols=1, spacing=0.5, pattern="dipole", polarization="cross")
+rx_array:
+  num_rows: 1
+  num_cols: 1
+  vertical_spacing: 0.5
+  horizontal_spacing: 0.5
+  pattern_i: 1       # "dipole"
+  polarization_i: 3  # "cross"
+
+radio_map:
+  auto_update: true
+  max_depth: 2
+  log_samples_per_it: 8.0
+  los: true
+  specular_reflection: true
+  diffuse_reflection: true
+  refraction: true
+  diffraction: false
+  edge_diffraction: false
+  color_map: "viridis"
+  metric: "sinr"
+  tx_power_dbm: 25.0
+  noise_power_dbm: -120.0
+  vmin: -10.0
+  vmax: 30.0
+  show_colorbar: true
+  use_alpha: true
+  use_direct_update_from_device: true
+  accumulate_max_samples_per_tx: 10000000000
+
+paths:
+  auto_update: true
+  min_update_delay_s: 0.0
+  max_depth: 2
+  synthetic_array: false
+  los: true
+  specular_reflection: true
+  diffuse_reflection: false
+  refraction: false
+  diffraction: false
+  edge_diffraction: false
+  accumulate_max_samples_per_src: 1000000000
+  max_num_paths_per_src: 1000000
+  samples_per_src: 1000000
+  compute_cir: false
+  num_taps: 10
+  fft_size: 512
+  subcarrier_spacing: 30000.0
+  l_min: 0
+  l_max: 100
+  num_time_steps: 1
+  normalize: false
+  normalize_delays: true
+  snr_offset_db: -50.0
+
+rendering:
+  mode: RAY_TRACING
+  default_resolution: [1920, 1080]
+  relative_resolution: 0.5
+  spp_per_frame: 8
+  max_accumulated_spp: 256
+  use_denoiser: true
+  envmap_factor: 1.0
+  envmap_rotation_deg: -60.0
+  slice_plane_normal: [0.0, 0.0, -1.0]
+  default_slice_plane_enabled: true

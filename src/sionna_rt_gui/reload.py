@@ -29,7 +29,11 @@ class AppHolder:
     """
 
     def __init__(
-        self, cfg, scene_filename: str | None, overrides: dict[str, Any] | None = None
+        self,
+        cfg,
+        scene_filename: str | None,
+        scenario_filename: str | None = None,
+        overrides: dict[str, Any] | None = None,
     ):
         import sionna_rt_gui
 
@@ -38,6 +42,7 @@ class AppHolder:
         )
         self.config_watcher: FilesWatcher | None = None
         self.scene_filename: str | None = scene_filename
+        self.scenario_filename: str | None = scenario_filename
         self.overrides: dict[str, Any] = overrides or {}
         self.app = None
 
@@ -56,7 +61,14 @@ class AppHolder:
         self.app = None
         self.app_failed = False
         drjit_cleanup()
-        self.config_watcher = FilesWatcher((cfg.config_path,))
+
+        watch_paths = [cfg.config_path]
+        if self.scene_filename and os.path.isfile(self.scene_filename):
+            watch_paths.append(self.scene_filename)
+        if self.scenario_filename and os.path.isfile(self.scenario_filename):
+            watch_paths.append(self.scenario_filename)
+
+        self.config_watcher = FilesWatcher(tuple(watch_paths))
         self.app = MainApp(cfg)
         self.last_valid_config = self.app.cfg
 
@@ -109,7 +121,9 @@ class AppHolder:
 
             try:
                 new_config = load_fn(
-                    new_config_path, scene_filename=self.scene_filename
+                    new_config_path,
+                    scene_filename=self.scene_filename,
+                    scenario_filename=self.scenario_filename,
                 )
             except Exception as e:
                 # We don't want to keep trying to load an invalid config

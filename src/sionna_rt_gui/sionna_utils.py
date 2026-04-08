@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+import logging
 import os
 
 import drjit as dr
@@ -17,6 +18,9 @@ from . import SCENES_DIR
 from .config import RadioMapConfig, DEFAULT_SLICE_PLANE_NAME
 from .ps_utils import supports_direct_update_from_device
 from .rm_utils import radio_map_texture
+
+
+logger = logging.getLogger(__name__)
 
 
 ITU_TO_PS_MATERIAL = {
@@ -54,27 +58,125 @@ def get_built_in_scenes() -> dict[str, str]:
     return result
 
 
-def add_scene_to_polyscope(scene: rt.Scene, ps_groups: dict[str, ps.Group]):
+def add_scene_to_polyscope(
+    scene: rt.Scene, ps_groups: dict[str, ps.Group], road_lift: float = 0.0
+):
     # Add the meshes to Polyscope
-    # TODO: apply consistent materials (based on radio material)
+    logger.info("Adding scene meshes to Polyscope...")
+
+    ROAD_KEYWORDS = {"marble", "route", "road", "white"}
+    GROUND_KEYWORDS = {"plane", "ground", "terrain"}
+
+    def get_clean_id(id_str):
+        if id_str.startswith("mat-itu_"):
+            return id_str[8:]
+        if id_str.startswith("itu_"):
+            return id_str[4:]
+        if id_str.startswith("mat-"):
+            return id_str[4:]
+        return id_str
+
+    total_meshes = 0
+    road_meshes = 0
     for mesh in scene.mi_scene.shapes():
+        total_meshes += 1
         mat = mesh.bsdf()
+        mesh_id = mesh.id()
+        mat_id = getattr(mat, "id", lambda: "")()
+
+        # Attempt to get a nice material for Polyscope based on ITU type
         ps_mat = None
-        if isinstance(mat, rt.RadioMaterialBase):
-            color = mat.color
-            # TODO: use fancier materials for rasterization
-            # if isinstance(mat, rt.ITURadioMaterial):
-            #     ps_mat = ITU_TO_PS_MATERIAL.get(mat.itu_type)
+        if hasattr(mat, "itu_type"):
+            ps_mat = ITU_TO_PS_MATERIAL.get(mat.itu_type)
+        if ps_mat is None and mat_id:
+            ps_mat = ITU_TO_PS_MATERIAL.get(get_clean_id(mat_id))
+
+        # Try to get color from the material itself, or from radio_materials mapping
+        # Prioritize radio_materials as it's more likely to be up-to-date in the GUI
+        rm = scene.radio_materials.get(mat_id)
+        if rm is None:
+            rm = scene.radio_materials.get(get_clean_id(mat_id))
+
+        if rm is not None and hasattr(rm, "color"):
+            color = rm.color
         else:
-            color = (0.65, 0.65, 0.65)
+            color = getattr(mat, "color", (0.65, 0.65, 0.65))
+
+        # Ensure color is a tuple of 3 floats
+        if hasattr(color, "numpy"):
+            color = color.numpy()
+
+        try:
+            if isinstance(color, (list, tuple, np.ndarray)):
+                color = [float(c) for c in color]
+            else:
+                color = [float(c) for c in list(color)]
+        except:
+            color = [0.65, 0.65, 0.65]
+
+        if len(color) > 3:
+            color = color[:3]
+        elif len(color) < 3:
+            color = list(color) + [0.0] * (3 - len(color))
+
+        color = tuple(color)
 
         vertices = mesh.vertex_positions_buffer().numpy().reshape(-1, 3)
         faces = mesh.faces_buffer().numpy().reshape(-1, 3)
+
+        m_id_low = mesh_id.lower()
+        mat_id_low = mat_id.lower()
+
+        # Determine if it's a road mesh
+        is_road = any(kw in m_id_low for kw in ROAD_KEYWORDS) or any(
+            kw in mat_id_low for kw in ROAD_KEYWORDS
+        )
+
+        # Special case: 'mesh-Plane' or similar might be ground even if it has marble material
+        if is_road and any(kw in m_id_low for kw in GROUND_KEYWORDS):
+            is_road = False
+
+        if is_road:
+            road_meshes += 1
+            # Apply Z-lift to road meshes to prevent Z-fighting with ground/concrete
+            if road_lift != 0.0:
+                vertices = vertices.copy()
+                vertices[:, 2] += road_lift
+                logger.debug(f"  - Applied road lift of {road_lift} to '{mesh_id}'")
+
+            ps_mat = "ceramic"
+            
+            # Ensure road color is visible (not too dark)
+            if np.mean(color) < 0.15:
+                color = (0.75, 0.75, 0.75) # Light gray for dark roads
+
         struct = ps.register_surface_mesh(
-            mesh.id(), vertices, faces, color=color, material=ps_mat
+            mesh_id, vertices, faces, color=color, material=ps_mat
         )
         struct.add_to_group(ps_groups["scene"])
         struct.set_ignore_slice_plane(DEFAULT_SLICE_PLANE_NAME, False)
+
+        # Log for debugging Z-layering and occlusion
+        if logger.isEnabledFor(logging.DEBUG):
+            bbox_min = np.min(vertices, axis=0) if vertices.size > 0 else [0, 0, 0]
+            bbox_max = np.max(vertices, axis=0) if vertices.size > 0 else [0, 0, 0]
+            logger.debug(
+                f"Mesh: '{mesh_id}' (Mat: '{mat_id}')\n"
+                f"  - Vertices: {vertices.shape[0]}, Faces: {faces.shape[0]}\n"
+                f"  - BBox: min={bbox_min}, max={bbox_max}\n"
+                f"  - Color: {color}, Polyscope Mat: {ps_mat}, Is Road: {is_road}"
+            )
+
+        if is_road:
+            struct.set_back_face_policy("identical")
+            struct.set_material("flat")  # Use flat shading for roads
+            # Note: We no longer override the material color to light gray by default,
+            # to allow the user to see the original XML color (even if dark) or 
+            # change it via the GUI.
+
+    logger.info(
+        f"Finished adding {total_meshes} meshes to Polyscope ({road_meshes} road-related)."
+    )
 
 
 def set_or_update_radio_devices_polyscope(
@@ -88,8 +190,8 @@ def set_or_update_radio_devices_polyscope(
             ps.get_point_cloud(name).remove()
         return
 
-    position_np = np.concatenate(
-        [rd.position.numpy().T for rd in radio_devices.values()], axis=0
+    position_np = np.stack(
+        [rd.position.numpy().flatten() for rd in radio_devices.values()], axis=0
     )
     struct = None
     if ps.has_point_cloud(name):
@@ -100,7 +202,12 @@ def set_or_update_radio_devices_polyscope(
             struct = candidate
 
     if struct is None:
-        display_radius = max(0.001 * scene_scale(gui.scene), 1)
+        # Increase transmitter size slightly to make them more prominent
+        scale = scene_scale(gui.scene)
+        display_radius = max(0.0005 * scale, 0.2)
+        if is_transmitter:
+            display_radius *= 1.5 # Even larger for transmitters
+
         struct = ps.register_point_cloud(
             name,
             position_np,
@@ -113,33 +220,55 @@ def set_or_update_radio_devices_polyscope(
         struct.set_ignore_slice_plane(DEFAULT_SLICE_PLANE_NAME, True)
 
     # Update orientations
-    rd_orientations = np.array(
-        [
-            # TODO: maybe use this when the new version of Mitsuba is released
-            # dr.quat_apply(
-            #     dr.euler_to_quat(rd.orientation.numpy().T[0]),
-            #     mi.ScalarVector3f(0, 0, 1),
-            # )
-            rotation_matrix(rd.orientation).numpy()[:, 0].T[0]
-            for rd in radio_devices.values()
-        ]
-    )
+    rd_orientations = []
+    for rd in radio_devices.values():
+        try:
+            # Robustly get orientation vector (forward vector)
+            # rd.orientation is [azimuth, elevation, roll]
+            angles = rd.orientation.numpy().flatten()
+            az, el = angles[0], angles[1]
+            
+            # Sionna RT coordinate system: 
+            # x = cos(el)*cos(az), y = cos(el)*sin(az), z = sin(el)
+            # (Matches Mitsuba/Sionna standard)
+            cos_el = np.cos(el)
+            forward = np.array([
+                cos_el * np.cos(az),
+                cos_el * np.sin(az),
+                np.sin(el)
+            ])
+            rd_orientations.append(forward)
+        except Exception as e:
+            logger.warning(f"Failed to calculate orientation for {rd.name}: {e}")
+            rd_orientations.append(np.array([1.0, 0.0, 0.0]))
+            
+    rd_orientations = np.stack(rd_orientations, axis=0)
+
     # Don't show orientation if it's the default value (all zero Euler angles)
-    is_default = np.all(
-        np.array([rd.orientation.numpy()[0] for rd in radio_devices.values()]) == 0,
-        axis=1,
-    )
-    rd_orientations[is_default, :] = 0
+    # UNLESS it is a transmitter, in which case we always want to see the azimuth.
+    if not is_transmitter:
+        is_default = np.all(
+            np.stack([rd.orientation.numpy().flatten() for rd in radio_devices.values()]) == 0,
+            axis=1,
+        )
+        rd_orientations[is_default, :] = 0
 
     sphere_radius = struct.get_radius()
+    # Transmitters get larger orientation arrows to show azimuths clearly
+    # We use a more aggressive scale to ensure visibility as "figures"
+    # Note: radius and length in Polyscope are relative to the structure's length scale.
+    # We normalize them by ps.get_length_scale() to keep them proportional to world units.
+    v_radius = (0.3 if is_transmitter else 0.1) * sphere_radius / ps.get_length_scale()
+    v_length = (5.0 if is_transmitter else 2.0) * sphere_radius / ps.get_length_scale()
+
     struct.add_vector_quantity(
         name + "_orientation",
         rd_orientations,
-        color=(0.6, 0.6, 0.6),
+        color=(0.0, 0.0, 0.0) if is_transmitter else (0.6, 0.6, 0.6),
         enabled=True,
         # Note: these are relative to the Polyscope scene scale
-        radius=0.3 * sphere_radius / ps.get_length_scale(),
-        length=2.5 * sphere_radius / ps.get_length_scale(),
+        radius=v_radius,
+        length=v_length,
     )
 
     # Also update per-point colors
@@ -177,7 +306,23 @@ def add_radio_map_to_polyscope(
 
         # Prepare color-mapped radio map (directly on device)
         dr.eval(radio_map.path_gain)  # Note: important to avoid kernel misses.
-        rm_values = dr.max(radio_map.path_gain, axis=0)
+
+        if cfg.metric == "path_gain":
+            rm_values = dr.max(radio_map.path_gain, axis=0)
+        elif cfg.metric == "rss":
+            p_tx = 10.0 ** (cfg.tx_power_dbm / 10.0) * 1e-3
+            rm_values = dr.sum(radio_map.path_gain * p_tx, axis=0)
+        elif cfg.metric == "sinr":
+            p_tx = 10.0 ** (cfg.tx_power_dbm / 10.0) * 1e-3
+            p_noise = 10.0 ** (cfg.noise_power_dbm / 10.0) * 1e-3
+            p_rx = radio_map.path_gain * p_tx
+            p_signal = dr.max(p_rx, axis=0)
+            p_total = dr.sum(p_rx, axis=0)
+            p_interference = p_total - p_signal
+            rm_values = p_signal / (p_interference + p_noise)
+        else:
+            rm_values = dr.max(radio_map.path_gain, axis=0)
+
         texture, alpha = radio_map_texture(
             rm_values,
             db_scale=True,
@@ -245,14 +390,6 @@ def get_or_add_planar_radio_map_mesh(
 
     rm_shape = radio_map.path_gain.shape[1:]
 
-    if ps.has_surface_mesh(name):
-        struct = ps.get_surface_mesh(name)
-
-        n_entries = dr.prod(rm_shape)
-        if n_entries == struct.n_vertices():
-            # TODO(!): need to update the vertices if pose changed, too
-            return struct
-
     # Create rectangle mesh to display the planar radio map.
     if use_alpha:
         # We need one vertex per entry in the radio map because spatially-varying
@@ -271,10 +408,32 @@ def get_or_add_planar_radio_map_mesh(
             ],
             axis=-1,
         ).reshape(-1, 4)
-        # Transform vertices to world coordinates (accounts from plane pose)
-        to_world = radio_map.to_world.matrix.numpy().squeeze()
-        vertices = (vertices @ to_world.T)[:, :3]
+    else:
+        vertices = np.array(
+            [
+                [-1, -1, 0, 1],
+                [1, -1, 0, 1],
+                [1, 1, 0, 1],
+                [-1, 1, 0, 1],
+            ]
+        )
+        vertices_x = vertices[:, 0]
+        vertices_y = vertices[:, 1]
 
+    # Transform vertices to world coordinates (accounts from plane pose)
+    to_world = radio_map.to_world.matrix.numpy().squeeze()
+    vertices = (vertices @ to_world.T)[:, :3]
+
+    if ps.has_surface_mesh(name):
+        struct = ps.get_surface_mesh(name)
+        if struct.n_vertices() == vertices.shape[0]:
+            struct.update_vertex_positions(vertices)
+            return struct
+        else:
+            # Topology changed, need to remove and re-add
+            ps.remove_surface_mesh(name)
+
+    if use_alpha:
         # Faces: two triangles per cell
         # Adapted from: https://stackoverflow.com/a/44935368
         r = np.arange(vertices.shape[0]).reshape(rm_shape)
@@ -287,20 +446,6 @@ def get_or_add_planar_radio_map_mesh(
         faces = faces.reshape(-1, 3)
 
     else:
-        vertices = np.array(
-            [
-                [-1, -1, 0, 1],
-                [1, -1, 0, 1],
-                [1, 1, 0, 1],
-                [-1, 1, 0, 1],
-            ]
-        )
-        vertices_x = vertices[:, 0]
-        vertices_y = vertices[:, 1]
-        # Transform vertices to world coordinates (accounts from plane pose)
-        to_world = radio_map.to_world.matrix.numpy().squeeze()
-        vertices = (vertices @ to_world.T)[:, :3]
-
         faces = np.array(
             [
                 [0, 1, 2],

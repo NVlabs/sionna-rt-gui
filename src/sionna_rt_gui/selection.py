@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from enum import Enum
 
+import logging
 import drjit as dr
 import mitsuba as mi
 import numpy as np
@@ -17,6 +18,9 @@ from sionna.rt.utils.geometry import rotation_matrix
 from .animation import trajectory_gui
 from .config import DEFAULT_SLICE_PLANE_NAME
 from .sionna_utils import set_or_update_radio_devices_polyscope
+
+
+logger = logging.getLogger(__name__)
 
 
 class SelectionType(Enum):
@@ -164,6 +168,29 @@ def selection_gui(
                 struct.set_transform(to_world)
 
             gui.prev_gizmo_to_world = to_world
+
+    elif selected_type == SelectionType.Mesh:
+        obj = selected_object
+        psim.Text(f"Mesh: '{obj.name}'")
+        if hasattr(obj, "radio_material"):
+            mat = obj.radio_material
+            if isinstance(mat, str):
+                mat = gui.scene.radio_materials.get(mat, mat)
+
+            mat_name = getattr(mat, "name", str(mat))
+            psim.Text(f"Material: {mat_name}")
+
+            if hasattr(mat, "color") and not isinstance(mat, str):
+                # Convert to list if it's a drjit array or similar
+                color = list(mat.color)
+
+                changed, new_color = psim.ColorEdit3(
+                    f"Color##mat_color_{obj.name}",
+                    color,
+                    psim.ImGuiColorEditFlags_NoInputs,
+                )
+                if changed:
+                    gui.update_material_color(mat, new_color)
 
     psim.Spacing()
 
