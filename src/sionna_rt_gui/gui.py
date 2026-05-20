@@ -241,6 +241,11 @@ class SionnaRtGui:
             self.create_example_scenario(
                 set_camera=not was_initialized, add_radio_map=False
             )
+        
+        if self.cfg.create_FAU_scenario:
+            self.create_FAU_scenario(
+                set_camera=not was_initialized, add_radio_map=False
+            )
 
     def create_example_scenario(
         self, set_camera: bool = True, add_radio_map: bool = True
@@ -287,6 +292,61 @@ class SionnaRtGui:
         traj.distance = 0.0  # Start at the first point
         self.animation_config.playing = True
         self.animation_config.speed_multiplier = 10.0
+
+        if add_radio_map:
+            self.set_radio_map(self.compute_radio_map(), show=True)
+        if self.cfg.paths.auto_update:
+            self.update_paths(show=True)
+
+    def create_FAU_scenario(
+        self, set_camera: bool = True, add_radio_map: bool = True
+    ):
+        if set_camera:
+            self.home_camera_to_world = np.array(
+                [
+                    [
+                        2.0079615e-03,
+                        -9.9999154e-01,
+                        -3.9256822e-08,
+                        4.4776478e00,
+                    ],
+                    [7.8317523e-01, 1.5742097e-03, 6.2179816e-01, 1.1707677e01],
+                    [
+                        -6.2179959e-01,
+                        -1.2489425e-03,
+                        7.8317869e-01,
+                        -2.2836572e02,
+                    ],
+                    [0.0000000e00, 0.0000000e00, 0.0000000e00, 1.0000000e00],
+                ]
+            )
+            self.move_camera_home()
+
+        # Add some example transmitters
+        # for pos in [
+        #     [-34.0, 13.0, 33.0],
+        # ]:
+        #     self.add_radio_device(pos, is_transmitter=True, allow_auto_update=False)
+
+        #     shifted = [pos[0] + 15, pos[1] - 14, pos[2] - 20]
+        #     self.add_radio_device(
+        #         shifted, is_transmitter=False, allow_auto_update=False
+        #     )
+        posTX = [28.0, -15.0, 1.0]
+        self.add_radio_device(posTX, is_transmitter=True, allow_auto_update=False)
+        posRX = [15.0, -21.0, 1.0]
+        self.add_radio_device(posRX, is_transmitter=False, allow_auto_update=False)
+        
+        # Example animation
+        # p = self.scene.get("rx-0").position.numpy().squeeze()
+        # traj = self.animation_config.trajectories["rx-0"]
+        # traj.add_point(p - [0, 30, 0])
+        # traj.add_point(p)
+        # traj.add_point(p + [40, 0, 0])
+        # traj.enabled = True
+        # traj.distance = 0.0  # Start at the first point
+        # self.animation_config.playing = True
+        # self.animation_config.speed_multiplier = 10.0
 
         if add_radio_map:
             self.set_radio_map(self.compute_radio_map(), show=True)

@@ -243,6 +243,7 @@ class GuiConfig:
     # Whether to create an example scenario with radio devices. Will auto-enable
     # if we're loading the default scene.
     create_example_scenario: bool = False
+    create_FAU_scenario: bool = False
 
     # If set, override the radio materials' thickness property
     radio_material_thickness: float | None = None
@@ -263,6 +264,9 @@ class GuiConfig:
     paths: PathsConfig = field(default_factory=PathsConfig)
 
     def __post_init__(self):
+        if self.create_FAU_scenario:
+            self.scene_filename = "/home/caai/Workspace/ObjectTracking4RTChannelEstimation/scenes/FAU_scene/FAU_scene.xml"
+
         if self.scene_filename is None:
             self.scene_filename = self.default_scene_filename
             # Only add example radio devices if we're loading the default scene.
