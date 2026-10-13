@@ -76,6 +76,22 @@ Almost all parameters can be set using YAML configuration files, see e.g. [`conf
 sionna-rt-gui --config path/to/config.yaml
 ```
 
+### Compute device
+
+By default, the GUI uses an NVIDIA GPU if it can run Dr.Jit's OptiX backend
+(compute capability 7.0 or higher), and falls back to the CPU otherwise. You can
+force a device with `--device` (or the `SIONNA_RT_GUI_DEVICE` environment
+variable):
+
+```bash
+python ./scripts/run.py --device cpu
+python ./scripts/run.py --device gpu
+```
+
+When running on the CPU, the ray-traced rendering mode is unavailable and the
+GUI uses rasterization instead. Radio-map and path computations still run on the
+CPU through Sionna RT, but will be slower.
+
 ### Live reload mode
 
 For development, use `--watch` to enable live code reloading:

@@ -544,12 +544,14 @@ class SionnaRtGui:
         self.ps_groups["scene"].set_enabled(not is_ray_tracing)
 
     def set_use_denoiser(self, use_denoiser: bool):
+        # The OptiX denoiser is only available with the CUDA variant.
+        use_denoiser = use_denoiser and ("cuda" in mi.variant())
         self.cfg.rendering.use_denoiser = use_denoiser
 
         # The integrator will be re-created, so we reset the rendering cache.
         self.render_cache = None
 
-        if self.cfg.rendering.use_denoiser:
+        if use_denoiser:
             self.denoiser = mi.OptixDenoiser(
                 input_size=self.cfg.rendering.rendering_resolution,
                 albedo=True,
